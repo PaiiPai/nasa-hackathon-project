@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DuckDB-WASM query page</title>
+<style>
+  :root { --bg:#f7f8fa; --fg:#1d2330; --muted:#5b6475; --line:#d6dae2; --accent:#2b5fd9; --panel:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { color-scheme: dark; --bg:#14171d; --fg:#e6e9ef; --muted:#9aa3b5; --line:#2c323d; --accent:#7ea2ff; --panel:#1b1f27; }
+  }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width:960px; margin:0 auto; padding:2rem 1rem; }
+  h1 { font-size:1.4rem; margin:0 0 .25rem; }
+  p { color:var(--muted); margin:0 0 1rem; }
+  textarea { width:100%; box-sizing:border-box; min-height:7rem; padding:.75rem; font:14px/1.4 ui-monospace, Menlo, monospace;
+             background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:6px; }
+  .bar { display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; margin:.75rem 0; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:.5rem 1rem; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  #status { color:var(--muted); font-size:.9rem; }
+  .out { overflow-x:auto; border:1px solid var(--line); border-radius:6px; background:var(--panel); }
+  table { border-collapse:collapse; width:100%; font-size:.9rem; }
+  th, td { text-align:left; padding:.4rem .7rem; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Query data in your browser</h1>
+  <p>Runs DuckDB entirely client-side. Query the bundled file at <code>data/sample.csv</code>, or load your own CSV or Parquet file.</p>
+
+  <textarea id="sql" spellcheck="false">SELECT site, country, avg_temp_c
+FROM 'data/sample.csv'
+ORDER BY avg_temp_c;</textarea>
+
+  <div class="bar">
+    <button id="run" disabled>Run query</button>
+    <label>Load a file: <input type="file" id="file" accept=".csv,.parquet,.json"></label>
+    <span id="status">Loading DuckDB…</span>
+  </div>
+  <div class="out" id="out"></div>
+</main>
+
+<script type="module">
+  // Pin an exact version; check npm for newer releases of @duckdb/duckdb-wasm.
+  import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm';
+
+  const $ = (id) => document.getElementById(id);
+  const status = (msg) => { $('status').textContent = msg; };
+
+  // 1. Pick the best WASM bundle the browser supports, served from jsDelivr.
+  const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+
+  // 2. Workers can't load cross-origin scripts directly, so wrap it in a same-origin blob.
+  const workerUrl = URL.createObjectURL(
+    new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' })
+  );
+  const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), new Worker(workerUrl));
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  URL.revokeObjectURL(workerUrl);
+  const conn = await db.connect();
+
+  // 3. Make the static data file readable by the name used in SQL.
+  //    Parquet files are fetched with HTTP range requests, so only needed parts download.
+  await db.registerFileURL('data/sample.csv', new URL('data/sample.csv', location.href).href,
+                           duckdb.DuckDBDataProtocol.HTTP, false);
+
+  status('Ready.');
+  $('run').disabled = false;
+
+  // 4. Let users query a local file without uploading it anywhere.
+  $('file').addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    await db.registerFileHandle(f.name, f, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
+    $('sql').value = `SELECT * FROM '${f.name}' LIMIT 100;`;
+    status(`Loaded ${f.name}. Run the query to see it.`);
+  });
+
+  // 5. Run the query and render an HTML table.
+  $('run').addEventListener('click', async () => {
+    $('run').disabled = true;
+    status('Running…');
+    const t0 = performance.now();
+    try {
+      const result = await conn.query($('sql').value);
+      const cols = result.schema.fields.map((f) => f.name);
+      const rows = result.toArray().map((r) => r.toJSON());
+      const cell = (v) => (v === null ? 'NULL' : typeof v === 'bigint' ? v.toString() : String(v));
+      const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+      $('out').innerHTML = `<table><thead><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead>
+        <tbody>${rows.map((r) => `<tr>${cols.map((c) => `<td>${esc(cell(r[c]))}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+      status(`${rows.length} rows in ${Math.round(performance.now() - t0)} ms.`);
+    } catch (err) {
+      $('out').innerHTML = '';
+      status(`Query failed: ${err.message}`);
+    } finally {
+      $('run').disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
